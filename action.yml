@@ -1,0 +1,164 @@
+name: "saved.sh backup"
+description: "Trigger a backup, or upload an artifact this job produced."
+author: "saved.sh"
+
+branding:
+  icon: "hard-drive"
+  color: "blue"
+
+inputs:
+  api-key:
+    description: "Org-scoped API key. Store it in repository secrets, never inline."
+    required: true
+  workspace-id:
+    description: "Workspace the backup belongs to."
+    required: true
+  backup-id:
+    description: "Backup to run, or to submit the file to."
+    required: true
+  file:
+    description: "Path to a file this job produced. Set it to submit an artifact; leave it empty to trigger the backup's own source."
+    required: false
+    default: ""
+  wait:
+    description: "Block until the run finishes and fail the job if it did not succeed. On by default: a step that goes green before the backup finishes reports that the request was accepted, not that anything was backed up. Set it to false only when you have decided you do not need to know."
+    required: false
+    default: "true"
+  timeout:
+    description: "Optional cap on the wait, as a Go duration. Empty means wait as long as the run takes. GitHub already caps a job with timeout-minutes, so setting a second limit here is only worth it when you want a different one. Reaching it warns and passes; a run that actually fails still fails the job."
+    required: false
+    default: ""
+  api-url:
+    description: "Backend base URL. Override only for self-hosted."
+    required: false
+    default: "https://api.saved.sh"
+  version:
+    description: "sctl release tag to install, or 'latest'."
+    required: false
+    default: "latest"
+
+outputs:
+  run-id:
+    description: "The run this action started. Empty until the trigger endpoint returns a run id; submitting a file returns one today."
+    value: ${{ steps.run.outputs.run-id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install sctl
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        case "$(uname -s)" in
+          Linux)  os=linux ;;
+          Darwin) os=darwin ;;
+          *) echo "::error::unsupported runner OS $(uname -s)"; exit 1 ;;
+        esac
+        case "$(uname -m)" in
+          x86_64|amd64) arch=amd64 ;;
+          arm64|aarch64) arch=arm64 ;;
+          *) echo "::error::unsupported runner architecture $(uname -m)"; exit 1 ;;
+        esac
+
+        base="https://github.com/savedhq/sctl/releases"
+        if [ "$VERSION" = latest ]; then
+          base="$base/latest/download"
+        else
+          base="$base/download/$VERSION"
+        fi
+
+        dir="$RUNNER_TEMP/sctl"
+        mkdir -p "$dir"
+        curl --fail --silent --show-error --location \
+          -o "$dir/sctl" "$base/sctl-$os-$arch"
+        curl --fail --silent --show-error --location \
+          -o "$dir/SHA256SUMS" "$base/SHA256SUMS"
+
+        # The checksum file lists every target, so match our line and verify only
+        # that one. An unverified binary handling backup credentials is not worth
+        # the convenience of skipping this.
+        expected="$(grep " sctl-$os-$arch\$" "$dir/SHA256SUMS" | cut -d' ' -f1)"
+        if [ -z "$expected" ]; then
+          echo "::error::no checksum published for sctl-$os-$arch"; exit 1
+        fi
+        if command -v sha256sum >/dev/null 2>&1; then
+          actual="$(sha256sum "$dir/sctl" | cut -d' ' -f1)"
+        else
+          actual="$(shasum -a 256 "$dir/sctl" | cut -d' ' -f1)"
+        fi
+        if [ "$expected" != "$actual" ]; then
+          echo "::error::checksum mismatch for sctl-$os-$arch"; exit 1
+        fi
+
+        chmod +x "$dir/sctl"
+        echo "$dir" >> "$GITHUB_PATH"
+
+    - name: Run
+      id: run
+      shell: bash
+      env:
+        # sctl reads SCTL_-prefixed variables through viper's AutomaticEnv.
+        SCTL_API_KEY: ${{ inputs.api-key }}
+        SCTL_WORKSPACE_ID: ${{ inputs.workspace-id }}
+        SCTL_BACKEND_URL: ${{ inputs.api-url }}
+        BACKUP_ID: ${{ inputs.backup-id }}
+        FILE: ${{ inputs.file }}
+        WAIT: ${{ inputs.wait }}
+        TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        set -euo pipefail
+
+        # Keep the key out of the log even if a command echoes its environment.
+        echo "::add-mask::$SCTL_API_KEY"
+
+        run_id=""
+        if [ -n "$FILE" ]; then
+          if [ ! -f "$FILE" ]; then
+            echo "::error::file not found: $FILE"; exit 1
+          fi
+          echo "Submitting $FILE to backup $BACKUP_ID"
+          output="$(sctl backup submit "$BACKUP_ID" "$FILE")"
+          echo "$output"
+          run_id="$(printf '%s' "$output" | sed -n 's/.*as run \([0-9a-f-]*\).*/\1/p')"
+        else
+          echo "Triggering backup $BACKUP_ID"
+          output="$(sctl backup trigger "$BACKUP_ID")"
+          echo "$output"
+          run_id="$(printf '%s' "$output" | sed -n 's/.*as run \([0-9a-f-]*\).*/\1/p')"
+        fi
+
+        echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+
+        if [ "$WAIT" != "true" ]; then
+          exit 0
+        fi
+        if [ -z "$run_id" ]; then
+          echo "::error::wait was requested but no run id came back, so there is nothing to wait on"
+          exit 1
+        fi
+
+        # No cap unless one was asked for. How long a runner may sit here is the
+        # caller's call, and GitHub's own timeout-minutes is the knob for it.
+        set +e
+        if [ -n "$TIMEOUT" ]; then
+          echo "Waiting up to $TIMEOUT for run $run_id"
+          sctl run wait "$run_id" --timeout "$TIMEOUT"
+        else
+          echo "Waiting for run $run_id"
+          sctl run wait "$run_id"
+        fi
+        status=$?
+        set -e
+
+        # 124 follows the timeout(1) convention and means the run was still going,
+        # which is not the same as failing. A slow backup is not the pipeline's
+        # problem to report, so it warns and passes. Any other non-zero is a run
+        # that actually failed, and that does fail the job.
+        if [ "$status" -eq 124 ]; then
+          echo "::warning title=Backup still running::Run $run_id had not finished after $TIMEOUT. It may still succeed. This step passed without confirming it."
+          exit 0
+        fi
+        exit "$status"
